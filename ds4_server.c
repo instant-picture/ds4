@@ -11262,6 +11262,12 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") && (!strcmp(hr.path, "/health") || !strcmp(hr.path, "/v1/health"))) {
+        http_response(fd, s->enable_cors, 200, "application/json", "{\"status\":\"ok\"}");
+        http_request_free(&hr);
+        goto done;
+    }
+
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);

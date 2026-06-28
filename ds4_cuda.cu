@@ -5960,6 +5960,75 @@ __device__ static float softplus_dev(float x) {
     return log1pf(expf(x));
 }
 
+/* Generic router for any n_expert (e.g. Flash Lite with 160 experts).
+ * ponytail: serial top-k per token; upgrade to warp reduction if n_expert grows */
+__global__ static void router_select_generic_batch_kernel(
+        int32_t *selected,
+        float   *weights,
+        float   *probs,
+        const float   *bias,
+        const int32_t *hash,
+        const float   *logits,
+        const int32_t *tokens,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        float    expert_weight_scale,
+        uint32_t hash_rows,
+        uint32_t n_tokens,
+        int has_bias,
+        int hash_mode) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tokens) return;
+
+    const float   *log_t  = logits   + (uint64_t)t * n_expert;
+    float         *prob_t = probs    + (uint64_t)t * n_expert;
+    int32_t       *sel_t  = selected + (uint64_t)t * n_expert_used;
+    float         *w_t    = weights  + (uint64_t)t * n_expert_used;
+
+    for (uint32_t e = 0; e < n_expert; e++)
+        prob_t[e] = sqrtf(softplus_dev(log_t[e]));
+
+    if (hash_mode && hash) {
+        int32_t tok = tokens ? tokens[t] : 0;
+        if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
+        const int32_t *row = hash + (uint64_t)tok * n_expert_used;
+        float sum = 0.0f;
+        for (uint32_t j = 0; j < n_expert_used; j++) {
+            int32_t e = row[j];
+            sel_t[j] = e;
+            float v = (e >= 0 && (uint32_t)e < n_expert) ? prob_t[(uint32_t)e] : 0.0f;
+            w_t[j] = v;
+            sum += v;
+        }
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (uint32_t j = 0; j < n_expert_used; j++) w_t[j] = w_t[j] / sum * expert_weight_scale;
+    } else {
+        float score[256];
+        for (uint32_t e = 0; e < n_expert; e++)
+            score[e] = prob_t[e] + (has_bias && bias ? bias[e] : 0.0f);
+
+        float   top_v[16]; int32_t top_i[16];
+        for (uint32_t j = 0; j < n_expert_used; j++) { top_v[j] = -1e38f; top_i[j] = 0; }
+        for (uint32_t e = 0; e < n_expert; e++) {
+            float v = score[e];
+            if (v <= top_v[n_expert_used - 1]) continue;
+            top_v[n_expert_used - 1] = v; top_i[n_expert_used - 1] = (int32_t)e;
+            for (uint32_t j = n_expert_used - 1; j > 0 && top_v[j] > top_v[j-1]; j--) {
+                float tv = top_v[j]; top_v[j] = top_v[j-1]; top_v[j-1] = tv;
+                int32_t ti = top_i[j]; top_i[j] = top_i[j-1]; top_i[j-1] = ti;
+            }
+        }
+        float sum = 0.0f;
+        for (uint32_t j = 0; j < n_expert_used; j++) {
+            sel_t[j] = top_i[j];
+            float v = ((uint32_t)top_i[j] < n_expert) ? prob_t[(uint32_t)top_i[j]] : 0.0f;
+            w_t[j] = v; sum += v;
+        }
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (uint32_t j = 0; j < n_expert_used; j++) w_t[j] = w_t[j] / sum * expert_weight_scale;
+    }
+}
+
 __global__ static void router_select_kernel(
         int32_t *selected,
         float *weights,
@@ -9530,7 +9599,33 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 }
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if (n_expert_used > 16u || n_expert > 256u) return 0;
+    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) {
+        /* Generic path for non-256-expert models (e.g. Flash Lite 160 experts) */
+        if (logits->bytes < (uint64_t)n_expert * sizeof(float) ||
+            probs->bytes  < (uint64_t)n_expert * sizeof(float) ||
+            selected->bytes < (uint64_t)n_expert_used * sizeof(int32_t) ||
+            weights->bytes  < (uint64_t)n_expert_used * sizeof(float)) return 0;
+        const float *bias = NULL;
+        const int32_t *hash = NULL;
+        if (has_bias && !hash_mode) {
+            if (bias_offset > model_size || model_size - bias_offset < (uint64_t)n_expert * sizeof(float)) return 0;
+            bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * sizeof(float), "router_bias");
+            if (!bias) return 0;
+        }
+        if (hash_mode) {
+            const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
+            if (hash_offset > model_size || hash_bytes > model_size - hash_offset) return 0;
+            hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
+            if (!hash) return 0;
+        }
+        router_select_generic_batch_kernel<<<1, 1>>>(
+            (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+            bias, hash, (const float *)logits->ptr, NULL,
+            n_expert, n_expert_used, expert_weight_scale,
+            hash_rows, 1, has_bias && !hash_mode, hash_mode);
+        return cuda_ok(cudaGetLastError(), "router_select_generic launch");
+    }
     int32_t tok = (int32_t)token;
     int ok = 1;
     const float *bias = NULL;
@@ -9567,27 +9662,35 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     return ok;
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
-        n_expert_groups > 1u || n_group_used > 0u ||
-        logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * 6u * sizeof(int32_t) ||
-        weights->bytes < (uint64_t)n_tokens * 6u * sizeof(float)) {
+        n_expert_groups > 1u || n_group_used > 0u || n_expert_used > 16u || n_expert > 256u ||
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
         return 0;
     }
     const float *bias = NULL;
     const int32_t *hash = NULL;
     if (has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) return 0;
-        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
+        if (bias_offset > model_size || model_size - bias_offset < (uint64_t)n_expert * sizeof(float)) return 0;
+        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * sizeof(float), "router_bias");
         if (!bias) return 0;
     }
     if (hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) return 0;
         hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) return 0;
+    }
+    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) {
+        /* Generic path for non-256-expert models (e.g. Flash Lite 160 experts) */
+        router_select_generic_batch_kernel<<<(n_tokens + 31u) / 32u, 32u>>>(
+            (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+            bias, hash, (const float *)logits->ptr, (const int32_t *)tokens->ptr,
+            n_expert, n_expert_used, expert_weight_scale,
+            hash_rows, n_tokens, has_bias && !hash_mode, hash_mode);
+        return cuda_ok(cudaGetLastError(), "router_select_generic_batch launch");
     }
     if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
         getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
